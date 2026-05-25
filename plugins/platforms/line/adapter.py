@@ -94,6 +94,7 @@ NAME_CACHE_TTL = 3600.0       # seconds — displayName cache
 IDEMPOTENCY_TTL = 3600.0      # seconds — LINE retries 5xx for up to ~1 hour
 MAX_BODY_BYTES = 1_048_576    # 1 MB — reject oversized webhook bodies
 LOADING_SECONDS = 20          # multiple of 5 in [5, 60]
+MAX_REPLY_TOKENS_PER_CHAT = 20  # cap on queued single-use reply tokens per chat
 
 
 def check_requirements() -> bool:
@@ -149,8 +150,15 @@ class LineAdapter(BasePlatformAdapter):
         self._runner = None  # web.AppRunner
         self._bot_user_id: str = ""
 
-        # chat_id -> (reply_token, deadline_ts)
-        self._reply_tokens: Dict[str, Tuple[str, float]] = {}
+        # Bearer header attached ONLY to LINE API calls — never set as a client
+        # default, so it can't leak to arbitrary external media hosts.
+        self._auth_headers = {"Authorization": f"Bearer {self.channel_access_token}"}
+
+        # chat_id -> list of (reply_token, deadline_ts).  Reply tokens are
+        # single-use and event-scoped: LINE may deliver several events from the
+        # same chat in one webhook batch, so we keep one token per event (FIFO)
+        # instead of overwriting, and consume the oldest still-valid one.
+        self._reply_tokens: Dict[str, List[Tuple[str, float]]] = {}
         # webhookEventId -> seen_ts (idempotency against LINE retries)
         self._seen_events: Dict[str, float] = {}
         # (scope, user_id) -> (display_name, ts)
@@ -176,16 +184,21 @@ class LineAdapter(BasePlatformAdapter):
 
         import httpx
 
+        # No default Authorization header: this client also fetches arbitrary
+        # external media URLs from webhook payloads, and the LINE token must
+        # never be sent to non-LINE hosts.  LINE API calls pass
+        # ``self._auth_headers`` explicitly.
         self._http = httpx.AsyncClient(
             timeout=httpx.Timeout(30.0, connect=10.0),
             limits=httpx.Limits(max_keepalive_connections=5, max_connections=20),
-            headers={"Authorization": f"Bearer {self.channel_access_token}"},
         )
 
         # Validate the token up front; a bad token is a fatal, non-retryable
         # misconfiguration rather than a transient connection failure.
         try:
-            resp = await self._http.get(f"{LINE_API_BASE}/v2/bot/info")
+            resp = await self._http.get(
+                f"{LINE_API_BASE}/v2/bot/info", headers=self._auth_headers
+            )
             if resp.status_code == 401:
                 logger.error("LINE: channel access token rejected (401)")
                 self._set_fatal_error(
@@ -297,6 +310,7 @@ class LineAdapter(BasePlatformAdapter):
             await self._http.post(
                 f"{LINE_API_BASE}/v2/bot/chat/loading/start",
                 json={"chatId": chat_id, "loadingSeconds": LOADING_SECONDS},
+                headers=self._auth_headers,
             )
         except Exception as e:
             logger.debug("LINE: loading indicator failed: %s", e)
@@ -482,8 +496,14 @@ class LineAdapter(BasePlatformAdapter):
     def _stash_reply_token(self, event: dict, now: float) -> None:
         token = event.get("replyToken")
         chat_id = self._chat_id_of(event.get("source", {}))
-        if token and chat_id:
-            self._reply_tokens[chat_id] = (token, now + REPLY_TOKEN_TTL)
+        if not token or not chat_id:
+            return
+        # Append per-event (FIFO); drop expired entries and cap the queue so a
+        # chatty group can't grow it without bound.
+        deadline = now + REPLY_TOKEN_TTL
+        queue = [t for t in self._reply_tokens.get(chat_id, []) if t[1] > now]
+        queue.append((token, deadline))
+        self._reply_tokens[chat_id] = queue[-MAX_REPLY_TOKENS_PER_CHAT:]
 
     async def _process_event(self, event: dict) -> None:
         """Map a single LINE event to a MessageEvent and dispatch it."""
@@ -639,13 +659,24 @@ class LineAdapter(BasePlatformAdapter):
                 url = provider.get("originalContentUrl")
                 if not url:
                     return None
-                resp = await self._http.get(url)
+                # Third-party host: never attach the LINE bearer token, and
+                # block private/internal targets (SSRF) before fetching.
+                try:
+                    from tools.url_safety import is_safe_url
+
+                    if not is_safe_url(url):
+                        logger.warning("LINE: blocked unsafe external media URL")
+                        return None
+                except Exception:
+                    pass
+                resp = await self._http.get(url, follow_redirects=True)
             else:
                 msg_id = message.get("id")
                 if not msg_id:
                     return None
                 resp = await self._http.get(
-                    f"{LINE_DATA_API_BASE}/v2/bot/message/{msg_id}/content"
+                    f"{LINE_DATA_API_BASE}/v2/bot/message/{msg_id}/content",
+                    headers=self._auth_headers,
                 )
             resp.raise_for_status()
             data = resp.content
@@ -708,7 +739,9 @@ class LineAdapter(BasePlatformAdapter):
         if not self._http:
             return SendResult(success=False, error="Not connected", retryable=True)
         try:
-            resp = await self._http.post(f"{LINE_API_BASE}{path}", json=body)
+            resp = await self._http.post(
+                f"{LINE_API_BASE}{path}", json=body, headers=self._auth_headers
+            )
         except Exception as e:
             # Connection-level failure — let the base retry.
             return SendResult(success=False, error=str(e), retryable=True)
@@ -732,11 +765,24 @@ class LineAdapter(BasePlatformAdapter):
         )
 
     def _take_reply_token(self, chat_id: str) -> Optional[str]:
-        entry = self._reply_tokens.pop(chat_id, None)
-        if not entry:
+        """Consume the oldest still-valid reply token for ``chat_id``.
+
+        Each inbound event contributes its own single-use token; we pop from
+        the front (FIFO) so replies sent in arrival order pair with the right
+        event, discarding any expired tokens we encounter.
+        """
+        tokens = self._reply_tokens.get(chat_id)
+        if not tokens:
             return None
-        token, deadline = entry
-        return token if time.time() < deadline else None
+        now = time.time()
+        while tokens:
+            token, deadline = tokens.pop(0)
+            if now < deadline:
+                if not tokens:
+                    self._reply_tokens.pop(chat_id, None)
+                return token
+        self._reply_tokens.pop(chat_id, None)
+        return None
 
     # ── Profile / group name lookups (cached) ─────────────────────────────
 
@@ -756,7 +802,7 @@ class LineAdapter(BasePlatformAdapter):
         else:
             url = f"{LINE_API_BASE}/v2/bot/profile/{user_id}"
         try:
-            resp = await self._http.get(url)
+            resp = await self._http.get(url, headers=self._auth_headers)
             if resp.status_code == 200:
                 name = resp.json().get("displayName")
                 if name:
@@ -774,7 +820,10 @@ class LineAdapter(BasePlatformAdapter):
         if not self._http:
             return None
         try:
-            resp = await self._http.get(f"{LINE_API_BASE}/v2/bot/group/{group_id}/summary")
+            resp = await self._http.get(
+                f"{LINE_API_BASE}/v2/bot/group/{group_id}/summary",
+                headers=self._auth_headers,
+            )
             if resp.status_code == 200:
                 name = resp.json().get("groupName")
                 if name:
@@ -876,8 +925,11 @@ class LineAdapter(BasePlatformAdapter):
         self._seen_events = {
             k: t for k, t in self._seen_events.items() if now - t < IDEMPOTENCY_TTL
         }
+        # Reply tokens are per-chat FIFO lists; drop expired tokens and empties.
         self._reply_tokens = {
-            k: v for k, v in self._reply_tokens.items() if v[1] > now
+            k: live
+            for k, v in self._reply_tokens.items()
+            if (live := [t for t in v if t[1] > now])
         }
         self._media_tokens = {
             k: v for k, v in self._media_tokens.items() if v[1] > now

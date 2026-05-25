@@ -156,13 +156,13 @@ class TestChunking:
 class TestReplyTokenCache:
     def test_single_use(self, monkeypatch):
         a = _make_adapter(monkeypatch)
-        a._reply_tokens["U1"] = ("TOK", time.time() + 50)
+        a._reply_tokens["U1"] = [("TOK", time.time() + 50)]
         assert a._take_reply_token("U1") == "TOK"
         assert a._take_reply_token("U1") is None  # consumed
 
     def test_expired_token_dropped(self, monkeypatch):
         a = _make_adapter(monkeypatch)
-        a._reply_tokens["U1"] = ("TOK", time.time() - 1)
+        a._reply_tokens["U1"] = [("TOK", time.time() - 1)]
         assert a._take_reply_token("U1") is None
 
     def test_stash_from_event(self, monkeypatch):
@@ -171,7 +171,31 @@ class TestReplyTokenCache:
             {"replyToken": "RT", "source": {"type": "user", "userId": "Ume"}},
             time.time(),
         )
-        assert a._reply_tokens["Ume"][0] == "RT"
+        assert a._reply_tokens["Ume"][0][0] == "RT"
+
+    def test_multiple_events_preserve_tokens(self, monkeypatch):
+        """Two events from the same chat must each keep their own token (FIFO)."""
+        a = _make_adapter(monkeypatch)
+        now = time.time()
+        a._stash_reply_token(
+            {"replyToken": "RT1", "source": {"type": "group", "groupId": "Cg"}}, now
+        )
+        a._stash_reply_token(
+            {"replyToken": "RT2", "source": {"type": "group", "groupId": "Cg"}}, now
+        )
+        assert a._take_reply_token("Cg") == "RT1"
+        assert a._take_reply_token("Cg") == "RT2"
+        assert a._take_reply_token("Cg") is None
+
+    def test_stash_drops_expired_and_caps(self, monkeypatch):
+        a = _make_adapter(monkeypatch)
+        now = time.time()
+        # one already-expired token should not survive a new stash
+        a._reply_tokens["Cg"] = [("OLD", now - 1)]
+        a._stash_reply_token(
+            {"replyToken": "NEW", "source": {"type": "group", "groupId": "Cg"}}, now
+        )
+        assert [t[0] for t in a._reply_tokens["Cg"]] == ["NEW"]
 
 
 # ── chat_id resolution ──────────────────────────────────────────────────────
@@ -307,7 +331,7 @@ class TestOutboundSend:
         a = _make_adapter(monkeypatch)
         a._http = MagicMock()
         a._http.post = AsyncMock(return_value=_resp(200, {"sentMessages": [{"id": "9"}]}))
-        a._reply_tokens["Ux"] = ("RT", time.time() + 50)
+        a._reply_tokens["Ux"] = [("RT", time.time() + 50)]
 
         result = await a.send("Ux", "hi")
         assert result.success is True
@@ -338,7 +362,7 @@ class TestOutboundSend:
                 _resp(200, {"sentMessages": [{"id": "2"}]}),
             ]
         )
-        a._reply_tokens["Ux"] = ("RT", time.time() + 50)
+        a._reply_tokens["Ux"] = [("RT", time.time() + 50)]
 
         result = await a.send("Ux", "hi")
         assert result.success is True
@@ -360,6 +384,73 @@ class TestOutboundSend:
         result = await a.send("Ux", "hi")
         assert result.success is False
         assert result.retryable is True
+
+
+# ── Inbound media download: token safety ───────────────────────────────────
+
+
+class TestInboundMediaTokenSafety:
+    @pytest.mark.asyncio
+    async def test_blob_download_sends_line_token(self, monkeypatch):
+        a = _make_adapter(monkeypatch)
+        a._http = MagicMock()
+        a._http.get = AsyncMock(return_value=_resp(200, content=b"data"))
+        monkeypatch.setattr(_line_mod, "cache_document_from_bytes", lambda d, n: "/c/f.bin")
+
+        path = await a._download_media(
+            {"type": "file", "id": "123", "fileName": "r.pdf",
+             "contentProvider": {"type": "line"}}
+        )
+        assert path == "/c/f.bin"
+        url = a._http.get.call_args[0][0]
+        headers = a._http.get.call_args[1].get("headers") or {}
+        assert "api-data.line.me" in url
+        assert headers.get("Authorization") == f"Bearer {a.channel_access_token}"
+
+    @pytest.mark.asyncio
+    async def test_external_download_omits_line_token(self, monkeypatch):
+        """The LINE bearer token must never be sent to a third-party media host."""
+        import tools.url_safety as url_safety
+
+        a = _make_adapter(monkeypatch)
+        a._http = MagicMock()
+        a._http.get = AsyncMock(return_value=_resp(200, content=b"data"))
+        monkeypatch.setattr(_line_mod, "cache_image_from_bytes", lambda d, ext=".jpg": "/c/i.jpg")
+        monkeypatch.setattr(url_safety, "is_safe_url", lambda u: True)
+
+        path = await a._download_media(
+            {
+                "type": "image",
+                "contentProvider": {
+                    "type": "external",
+                    "originalContentUrl": "https://cdn.evil.example.com/x.jpg",
+                },
+            }
+        )
+        assert path == "/c/i.jpg"
+        headers = a._http.get.call_args[1].get("headers") or {}
+        assert "Authorization" not in headers
+
+    @pytest.mark.asyncio
+    async def test_external_download_blocked_when_unsafe(self, monkeypatch):
+        import tools.url_safety as url_safety
+
+        a = _make_adapter(monkeypatch)
+        a._http = MagicMock()
+        a._http.get = AsyncMock(return_value=_resp(200, content=b"data"))
+        monkeypatch.setattr(url_safety, "is_safe_url", lambda u: False)
+
+        path = await a._download_media(
+            {
+                "type": "image",
+                "contentProvider": {
+                    "type": "external",
+                    "originalContentUrl": "http://169.254.169.254/latest/meta-data/",
+                },
+            }
+        )
+        assert path is None
+        assert not a._http.get.called
 
 
 # ── send_typing ──────────────────────────────────────────────────────────
