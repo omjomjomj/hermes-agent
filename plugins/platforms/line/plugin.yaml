@@ -1,0 +1,13 @@
+name: line-platform
+kind: platform
+version: 1.0.0
+description: >
+  LINE Messaging API gateway adapter for Hermes Agent.
+  Receives inbound messages via an aiohttp webhook listener (HMAC-verified)
+  and replies through the LINE Reply / Push API. Uses httpx (already a core
+  dependency) plus stdlib hmac, so no line-bot-sdk is required. aiohttp ships
+  with the messaging extra.
+author: Nous Research
+requires_env:
+  - LINE_CHANNEL_ACCESS_TOKEN
+  - LINE_CHANNEL_SECRET
